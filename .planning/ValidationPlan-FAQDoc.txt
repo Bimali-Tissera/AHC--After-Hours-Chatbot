@@ -1,0 +1,227 @@
+# Validation Phase Plan: Ekwa.com Chatbot
+
+## Context
+The chatbot currently works with a dental FAQ DOCX → n8n "Update KB" → Pinecone pipeline. Before building the chat widget UI, we need to **validate the full system on ekwa.com** using Ekwa Marketing's own content. This proves the pipeline works end-to-end and is repeatable for future dental practice clients.
+
+**Why FAQ doc over webscraper:** The doc approach matches the existing pipeline exactly (zero new infra), gives full quality control, and scales naturally — each new practice = a new FAQ doc + re-run ingestion. The bottleneck is content gathering, not technology.
+
+---
+
+## Architecture: Per-Practice FAQ Doc Pipeline
+
+```
+[Practice FAQ Doc]  →  [n8n "Update KB" Workflow]  →  [OpenAI Embeddings]  →  [Pinecone (namespaced)]
+                                                                                      ↓
+[Chat Widget]  →  [/api/chat proxy]  →  [n8n "AI Assistant"]  →  [Pinecone query]  →  [Response]
+```
+
+**Scaling to multiple practices:**
+- Each practice gets its own FAQ DOCX (e.g., `Ekwa_Marketing_FAQ.docx`, `SmileDental_FAQ.docx`)
+- Each doc is ingested into Pinecone under the practice's namespace (`practice_id`)
+- The n8n AI Assistant queries the correct namespace based on `practice_id` in the request
+- Per-practice behavior (tone, prompts, lead capture rules) stored in Supabase `practices.chatbot_config`
+
+---
+
+## Step 0: Create `Ekwa_Marketing_FAQ.docx`
+
+### Recommended Method: AI-Assisted Extraction
+
+**Fastest approach — use ChatGPT or Claude with web access to draft the doc:**
+
+1. **Open ChatGPT (with browsing enabled) or Claude with web search**
+2. **Prompt it:**
+   > "Go to https://www.ekwa.com/ and browse through the main pages (Home, About, Services, Team, Contact, any pricing/case studies pages). Create a comprehensive FAQ document organized by category. For each category, write 5-10 Q&A pairs based on the content you find. Format it like this:
+   >
+   > ## Category Name
+   > **Q: [Question a visitor would ask]**
+   > A: [Answer based on the website content]
+   >
+   > Categories should include: Company Overview, Services, Team, Process/How It Works, Pricing/Getting Started, Contact & Support"
+
+3. **Copy the output into a Word doc** (`Ekwa_Marketing_FAQ.docx`)
+4. **Review and edit** — fix any hallucinated info, add missing details, adjust tone
+5. **Place in project root** alongside `Dental_FAQ_Knowledge_Base_v1.docx`
+
+### Alternative Tools for Content Extraction
+
+| Tool | How to Use | Best For |
+|---|---|---|
+| **ChatGPT Browse** | Prompt with URL + "create FAQ from this site" | Fastest, generates Q&A format directly |
+| **Claude Web Search** | Same prompt approach | Good alternative to ChatGPT |
+| **Fireshot / Full Page Screenshot** | Screenshot each page, then feed to Claude/ChatGPT | When you want to preserve exact visual content |
+| **SingleFile (browser extension)** | Saves complete webpage as single HTML file | Offline reference while writing FAQ |
+| **Markdown Web Clipper (extension)** | Clips page content as clean markdown | Quick text extraction, needs manual Q&A formatting |
+| **Copy-paste manually** | Browse each page, copy key content sections | Most control, slower but no tools needed |
+
+### FAQ Doc Structure (follow same pattern as dental doc)
+
+```
+# Ekwa Marketing - Knowledge Base
+
+## Company Overview
+Q: What is Ekwa Marketing?
+A: Ekwa Marketing is a digital marketing agency specializing in...
+
+Q: Where is Ekwa located?
+A: ...
+
+## Services
+Q: What services does Ekwa offer?
+A: Ekwa offers website design, SEO, PPC advertising, social media...
+
+Q: Does Ekwa build custom websites?
+A: ...
+
+## Team
+Q: Who leads Ekwa Marketing?
+A: ...
+
+## Process / How It Works
+Q: How does the onboarding process work?
+A: ...
+
+## Pricing & Getting Started
+Q: How much does a website cost?
+A: For specific pricing, we'd love to chat about your practice's needs...
+
+Q: How do I get started with Ekwa?
+A: ...
+
+## Contact & Support
+Q: How can I contact Ekwa?
+A: ...
+
+Q: What are Ekwa's business hours?
+A: ...
+```
+
+**Target: 30-50 Q&A pairs** covering all major pages. This matches the dental FAQ doc scope.
+
+---
+
+## Step 1: Ingest Ekwa FAQ into Pinecone
+
+- Upload `Ekwa_Marketing_FAQ.docx` to the n8n "Update KB" workflow
+- Use a **separate Pinecone namespace** for Ekwa (e.g., `ekwa-marketing` or the practice UUID)
+- Verify the existing dental FAQ stays in its own namespace — no cross-contamination
+- No code changes needed — the pipeline already works
+
+---
+
+## Step 2: Per-Practice AI Config in Supabase
+**Files:** `supabase/migrations/add_chatbot_config.sql`, update `src/lib/supabase/types.ts`
+
+- Add `chatbot_config JSONB` column to `practices` table
+- Config holds per-practice behavior:
+
+```json
+{
+  "system_prompt": "You are the AI assistant for Ekwa Marketing, a dental marketing company...",
+  "tone": "professional-friendly",
+  "welcome_message": "Hi! I'm the Ekwa assistant. How can I help you today?",
+  "escalation_rules": {
+    "enabled": true,
+    "trigger_phrases": ["speak to someone", "real person", "sales team"]
+  },
+  "lead_capture": {
+    "enabled": true,
+    "trigger_on": ["pricing", "demo", "get started", "consultation"],
+    "fields": ["name", "email", "phone", "practice_name"]
+  },
+  "emergency_handling": { "enabled": false },
+  "pinecone_namespace": "ekwa-marketing"
+}
+```
+
+- Create Ekwa Marketing practice row with this config
+- **Why Supabase:** queryable by n8n at runtime, editable via future admin settings page, no redeployment needed
+
+---
+
+## Step 3: Update n8n Workflows
+**Reference:** `N8N_WORKFLOWS.md`
+
+- **AI Assistant workflow:**
+  - At conversation start, query Supabase `practices.chatbot_config` using `practice_id`
+  - Use `system_prompt` from config instead of hardcoded dental prompt
+  - Use `pinecone_namespace` from config for vector search
+  - Apply lead capture / escalation rules from config
+- **Update KB workflow:** Ensure it supports namespace parameter so different docs go to different namespaces
+
+---
+
+## Step 4: Retrieval Validation
+Test before building any UI:
+
+| Test Query | Expected Behavior |
+|---|---|
+| "What services does Ekwa offer?" | Returns Ekwa marketing services |
+| "Who is on the Ekwa team?" | Returns team info |
+| "How much does a website cost?" | Triggers lead capture or gives general info |
+| "Do you accept Delta Dental?" | Does NOT return (wrong namespace) |
+
+- Verify namespace isolation works
+- Iterate on FAQ doc if retrieval quality is poor (add more Q&As, rephrase)
+
+---
+
+## Step 5: Chat Widget (Minimal for Validation)
+**Files:** `src/app/api/chat/route.ts`, `src/app/widget/[practiceId]/page.tsx`, widget components
+
+- **API proxy route** (`/api/chat`): forwards `{ practice_id, message, session_id }` to n8n webhook. CORS headers for cross-origin.
+- **Widget page** (`/widget/[practiceId]`): floating chat bubble, message thread, handles response types (faq, lead_capture, escalation)
+- **No `isAfterHours()` gate** during validation — widget always active
+- **Test via standalone HTML file** that embeds the widget (simulates ekwa.com)
+
+---
+
+## Step 6: End-to-End Testing
+
+- FAQ answers about Ekwa services, team, offerings
+- Lead capture triggers on "demo", "pricing", "consultation"
+- Verify leads appear in admin dashboard
+- Verify conversations stored in Supabase
+- Verify dental FAQ queries are isolated (no cross-contamination)
+- Test 20+ conversation turns for coherence
+- Iterate on: system prompt wording, FAQ doc content, lead capture triggers
+
+---
+
+## File Structure After Implementation
+
+```
+Ekwa_Marketing_FAQ.docx           # Ekwa knowledge base (same format as dental doc)
+src/
+  app/
+    api/chat/route.ts             # n8n webhook proxy
+    widget/[practiceId]/
+      page.tsx                    # Embeddable chat widget
+  lib/supabase/types.ts           # Extended with ChatbotConfig type
+supabase/
+  migrations/
+    add_chatbot_config.sql        # Per-practice config column
+```
+
+---
+
+## Key Files to Modify
+- `supabase/schema.sql` — extend practices table with `chatbot_config`
+- `src/lib/supabase/types.ts` — add ChatbotConfig type
+- n8n workflows (external) — AI Assistant reads config from Supabase
+
+## Scaling Playbook (Post-Validation)
+For each new dental practice:
+1. Create their FAQ DOCX (use AI-assisted extraction from their website)
+2. Ingest into Pinecone under their practice namespace
+3. Add practice row in Supabase with their `chatbot_config`
+4. Embed widget on their site with `data-practice-id="their-uuid"`
+5. Done — no code changes needed
+
+## Verification
+1. `Ekwa_Marketing_FAQ.docx` created with 30-50 Q&A pairs
+2. Doc ingested into Pinecone under ekwa namespace via n8n
+3. Test queries return relevant Ekwa content (not dental)
+4. Widget sends messages → gets correct Ekwa answers
+5. Leads captured and visible in admin dashboard
+6. Dental FAQ still works independently (namespace isolation)

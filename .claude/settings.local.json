@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(node:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(npm run:*)",
+      "Bash(npx next:*)",
+      "Bash(curl:*)",
+      "Bash(find /c/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/src/app/api -type f -name *.ts -o -name *.js)",
+      "Bash(find /c/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/src -type f \\\\\\(-name *.ts -o -name *.tsx \\\\\\))",
+      "Bash(ls \"C:/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/.env\"*)",
+      "Bash(ls \"C:/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/.env.local\"*)",
+      "Bash(ls \"C:/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/.env.example\"*)",
+      "Bash(grep -E \"\\\\.\\(md|txt|env\\)$\")",
+      "Bash(git remote:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(ls -la /c/Users/Bizycorp_Work/Documents/After-Hours-Chatbot/next.*)",
+      "Bash(find C:UsersBizycorp_Work.claudeprojectsC--Users-Bizycorp-Work-Documents-After-Hours-Chatbotmemory -type f -name *.md)",
+      "Bash(grep -iE '\\\\.\\(png|jpg|jpeg|msix\\)$')"
+    ]
+  }
+}

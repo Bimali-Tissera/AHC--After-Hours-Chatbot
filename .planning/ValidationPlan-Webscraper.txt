@@ -1,0 +1,137 @@
+# Validation Phase Plan: Ekwa.com Chatbot
+
+## Context
+The chatbot currently works with a dental FAQ DOCX → n8n → Pinecone pipeline. Before building the chat widget UI, we need to **validate the full system on ekwa.com** using Ekwa Marketing's own content. This proves the pipeline works end-to-end and is repeatable for future dental practice clients. The architecture must make it easy to swap both **data sources** (doc, scraper, API) and **AI behavior** (tone, prompts, lead capture rules) per client.
+
+---
+
+## Architecture: Modular Data Pipeline
+
+```
+[Data Source]  →  [Adapter Script]  →  data/{client}-chunks.json  →  [n8n Ingest Workflow]  →  Pinecone
+     ↑                                        ↑                                                    ↑
+  Swappable                           Standardized format                              Namespaced per practice
+```
+
+**Universal chunk format** (all adapters output this):
+```ts
+interface ContentChunk {
+  id: string;                // hash of source_url + chunk_index
+  practice_id: string;       // Pinecone namespace key
+  source_url: string;        // origin page
+  source_type: "scrape" | "document" | "api";
+  title: string;             // page title or section heading
+  content: string;           // text chunk (500-800 tokens)
+  metadata: { scraped_at: string; page_section: string; }
+}
+```
+
+Adding a new client = write an adapter script that outputs this format. Downstream pipeline never changes.
+
+---
+
+## Step-by-Step Plan
+
+### Step 1: Build the Ekwa.com Webscraper
+**Files:** `scripts/scrape-ekwa.ts`, `scripts/lib/chunker.ts`, `scripts/lib/types.ts`
+**Deps:** `cheerio` (add to package.json)
+
+- Use `cheerio` + native `fetch` — ekwa.com is server-rendered, no headless browser needed
+- Seed URLs: homepage + all links from main nav (services, about, team, contact, etc.)
+- Per page: extract main content area (skip nav/footer/scripts), split by headings into sections
+- Chunk sections into 500-800 token pieces using `chunker.ts`
+- Output → `data/ekwa-chunks.json` (gitignored)
+- Add npm script: `"scrape:ekwa": "npx tsx scripts/scrape-ekwa.ts"`
+- **Manual review** of output — read 10-15 chunks, confirm no HTML artifacts or boilerplate
+
+### Step 2: Per-Practice AI Config in Supabase
+**Files:** `supabase/migrations/add_chatbot_config.sql`, update `src/lib/supabase/types.ts`
+
+- Add `chatbot_config JSONB` column to `practices` table
+- Config holds: `system_prompt`, `tone`, `lead_capture` rules, `escalation_rules`, `emergency_handling` (disabled for Ekwa), `welcome_message`, `pinecone_namespace`
+- Create/update Ekwa Marketing practice row with appropriate config:
+  - System prompt: corporate marketing assistant (not dental)
+  - Lead capture triggers: "demo", "pricing", "get started", "consultation"
+  - Emergency handling: **disabled**
+
+### Step 3: Update n8n Workflows
+**Reference:** `N8N_WORKFLOWS.md`
+
+- **Ingest workflow:** Modify "Update KB" (or create new "Ingest Chunks") to accept standardized JSON chunks via webhook POST, embed with OpenAI, upsert to Pinecone with practice namespace
+- **AI Assistant workflow:**
+  - Query Supabase `practices.chatbot_config` at conversation start using `practice_id`
+  - Use `system_prompt` from config instead of hardcoded dental prompt
+  - Use `pinecone_namespace` from config for vector search
+  - Apply lead capture / escalation rules from config
+- Run ingestion: POST `data/ekwa-chunks.json` to the ingest workflow
+
+### Step 4: Retrieval Validation
+Test Pinecone retrieval before building any UI:
+
+| Test Query | Expected Behavior |
+|---|---|
+| "What services does Ekwa offer?" | Returns Ekwa marketing services |
+| "Who is on the Ekwa team?" | Returns team info |
+| "How much does a website cost?" | Triggers lead capture or general info |
+| "Do you accept Delta Dental?" | Does NOT return results (wrong namespace) |
+
+- Verify namespace isolation: dental queries stay in dental namespace
+- Iterate on chunk quality if retrieval is poor
+
+### Step 5: Chat Widget (Minimal for Validation)
+**Files:** `src/app/api/chat/route.ts`, `src/app/widget/[practiceId]/page.tsx`, widget components
+
+- **API proxy route** (`/api/chat`): forwards `{ practice_id, message, session_id }` to n8n webhook, returns response. CORS headers for cross-origin.
+- **Widget page** (`/widget/[practiceId]`): floating chat bubble, message thread, handles response types (faq, lead_capture, escalation)
+- **No `isAfterHours()` gate** during validation — widget always active
+- **Test via standalone HTML file** that embeds the widget (simulates ekwa.com) — no need to modify actual ekwa.com yet
+
+### Step 6: End-to-End Testing
+Full test matrix through the widget:
+
+- FAQ answers about Ekwa services, team, offerings
+- Lead capture triggers on "demo", "pricing", "consultation"
+- Verify leads appear in admin dashboard
+- Verify conversations stored in Supabase
+- Verify dental FAQ queries are isolated (no cross-contamination)
+- Test 20+ conversation turns for coherence
+- Iterate on: system prompt wording, scraper coverage, chunk quality
+
+---
+
+## File Structure After Implementation
+
+```
+scripts/
+  scrape-ekwa.ts              # Ekwa webscraper
+  lib/
+    chunker.ts                # Reusable text chunking
+    types.ts                  # ContentChunk interface
+data/
+  ekwa-chunks.json            # Scraper output (gitignored)
+src/
+  app/
+    api/chat/route.ts         # n8n webhook proxy
+    widget/[practiceId]/
+      page.tsx                # Embeddable chat widget
+supabase/
+  migrations/
+    add_chatbot_config.sql    # Per-practice config column
+```
+
+---
+
+## Key Files to Modify
+- `supabase/schema.sql` — extend practices table
+- `src/lib/supabase/types.ts` — add ContentChunk, ChatbotConfig types
+- `package.json` — add cheerio dep + scraper script
+- `.gitignore` — add `data/` directory
+- n8n workflows (external) — Update KB + AI Assistant
+
+## Verification
+1. Run `npm run scrape:ekwa` → produces valid `data/ekwa-chunks.json`
+2. POST chunks to n8n ingest → vectors appear in Pinecone under ekwa namespace
+3. Query Pinecone via n8n AI Assistant → returns relevant Ekwa content
+4. Open widget test page → send messages → get correct Ekwa answers
+5. Check admin dashboard → leads captured from widget conversations
+6. Query dental FAQ → still works, no namespace cross-contamination
